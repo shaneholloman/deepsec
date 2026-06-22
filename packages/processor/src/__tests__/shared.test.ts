@@ -310,6 +310,18 @@ describe("parseInvestigateResults", () => {
     expect(out.find((r) => r.filePath === "b.ts")?.findings).toEqual([]);
   });
 
+  it("repairs common malformed model JSON before parsing findings", () => {
+    const text =
+      'Confirmed:\n```json\n[{"filePath":"a.ts","findings":[{"severity":"MEDIUM","description":"Uses "signature !== expectedHash" comparison",}]}';
+
+    const out = parseInvestigateResults(text, batch);
+
+    expect(out.find((r) => r.filePath === "a.ts")?.findings[0]?.description).toBe(
+      'Uses "signature !== expectedHash" comparison',
+    );
+    expect(out.find((r) => r.filePath === "b.ts")?.findings).toEqual([]);
+  });
+
   it("throws on parse failure (fail-loud, never silently empty)", () => {
     // Silently returning empty findings on malformed JSON would mask
     // model truncation, prompt-injection-driven non-JSON output, and
@@ -335,6 +347,16 @@ describe("parseRevalidateVerdicts", () => {
     const v = parseRevalidateVerdicts(text);
     expect(v).toHaveLength(1);
     expect(v[0].verdict).toBe("true-positive");
+  });
+
+  it("repairs common malformed model JSON before parsing verdicts", () => {
+    const text =
+      'Here are the verdicts:\n```json\n[{"filePath":"a.ts","title":"x","verdict":"true-positive","reasoning":"Line says "unsafe" but is mitigated",}]';
+
+    const v = parseRevalidateVerdicts(text);
+
+    expect(v).toHaveLength(1);
+    expect(v[0].reasoning).toBe('Line says "unsafe" but is mitigated');
   });
 
   it("throws on parse failure", () => {

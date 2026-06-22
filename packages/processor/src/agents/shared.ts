@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { dataDir, type FileRecord, type Finding, type RefusalReport } from "@deepsec/core";
+import { jsonrepair } from "jsonrepair";
 import type { InvestigateResult, RevalidateVerdict } from "./types.js";
 
 // --- Retry / backoff -------------------------------------------------------
@@ -442,6 +443,8 @@ export function buildInvestigateJsonRepairPrompt(batch: FileRecord[]): string {
 
 Do not redo the investigation and do not use tools. Re-output the same conclusions from your previous response as ONLY one valid JSON array. No prose before or after. No "Confirmed:" preface. A \`\`\`json fenced block is acceptable, but the content inside must be valid JSON.
 
+Keep string values compact. Escape double quotes inside strings as \`\\"\`, escape newlines as \`\\n\`, and do not put raw line breaks inside JSON string values.
+
 Include exactly these target files, with an empty findings array for any file where you found no real issue:
 
 ${fileListForRepairPrompt(batch)}
@@ -474,6 +477,8 @@ export function buildRevalidateJsonRepairPrompt(): string {
   return `Your previous response was not valid JSON, so the scanner could not parse it.
 
 Do not redo the revalidation and do not use tools. Re-output the same verdicts and reasoning from your previous response as ONLY one valid JSON array. No prose before or after. No "Confirmed:" preface. A \`\`\`json fenced block is acceptable, but the content inside must be valid JSON.
+
+Keep string values compact. Escape double quotes inside strings as \`\\"\`, escape newlines as \`\\n\`, and do not put raw line breaks inside JSON string values.
 
 Use this exact schema:
 
@@ -508,34 +513,85 @@ export function jsonRepairFailureError(originalError: unknown, repairError: unkn
   );
 }
 
+function extractAgentJsonPayload(resultText: string): string {
+  const fenced = resultText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) return fenced[1].trim();
+
+  const openFence = resultText.match(/```(?:json)?\s*([\s\S]*)$/i);
+  if (openFence) return openFence[1].trim();
+
+  return resultText.trim();
+}
+
+function extractArrayCandidateForRepair(jsonPayload: string): string {
+  const trimmed = jsonPayload.trim();
+  if (trimmed.startsWith("[")) return trimmed;
+
+  const arrayStart = /\[\s*(?:\{|\])/.exec(trimmed);
+  if (!arrayStart) return trimmed;
+
+  const candidate = trimmed.slice(arrayStart.index);
+  const lastClose = candidate.lastIndexOf("]");
+  return lastClose >= 0 ? candidate.slice(0, lastClose + 1) : candidate;
+}
+
+function parseAgentJsonArray(params: {
+  resultText: string;
+  parseFailurePrefix: string;
+  nonArrayMessage: (parsed: unknown) => string;
+}): unknown[] {
+  const { resultText, parseFailurePrefix, nonArrayMessage } = params;
+  const jsonPayload = extractAgentJsonPayload(resultText);
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonPayload);
+  } catch (strictErr) {
+    const repairCandidate = extractArrayCandidateForRepair(jsonPayload);
+    try {
+      parsed = JSON.parse(jsonrepair(repairCandidate));
+    } catch (repairErr) {
+      const excerpt = resultText.slice(0, 400).replace(/\s+/g, " ");
+      throw new Error(
+        `${parseFailurePrefix}: ${strictErr instanceof Error ? strictErr.message : strictErr}. ` +
+          `Tolerant jsonrepair failed: ${repairErr instanceof Error ? repairErr.message : repairErr}. ` +
+          `First 400 chars: ${excerpt}`,
+      );
+    }
+
+    if (!Array.isArray(parsed)) {
+      const excerpt = resultText.slice(0, 400).replace(/\s+/g, " ");
+      throw new Error(
+        `${parseFailurePrefix}: ${strictErr instanceof Error ? strictErr.message : strictErr}. ` +
+          `Tolerant jsonrepair returned ${typeof parsed}, not an array. ` +
+          `First 400 chars: ${excerpt}`,
+      );
+    }
+
+    return parsed;
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error(nonArrayMessage(parsed));
+  }
+
+  return parsed;
+}
+
 export function parseInvestigateResults(
   resultText: string,
   batch: FileRecord[],
 ): InvestigateResult[] {
-  const jsonMatch = resultText.match(/```json\s*([\s\S]*?)```/);
-  const jsonStr = jsonMatch ? jsonMatch[1].trim() : resultText.trim();
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonStr);
-  } catch (err) {
-    // Fail loud — a malformed JSON response is indistinguishable from
-    // a "found nothing" run if we silently return empty findings, and
-    // for a security tool that's the worst possible failure mode
-    // (truncated model output, rate-limit splice, prompt-injection
-    // override could all suppress real findings). The processor's
-    // batch-level catch fires from this throw, marks files status=error,
-    // increments errorBatchCount, and the CLI exits non-zero.
-    const excerpt = resultText.slice(0, 400).replace(/\s+/g, " ");
-    throw new Error(
-      `Agent produced output that wasn't a parseable JSON findings array: ${err instanceof Error ? err.message : err}. ` +
-        `First 400 chars: ${excerpt}`,
-    );
-  }
-
-  if (!Array.isArray(parsed)) {
-    throw new Error(`Agent produced JSON but not an array of file findings. Got: ${typeof parsed}`);
-  }
+  // Fail loud when neither strict JSON nor tolerant jsonrepair can produce
+  // an array. A malformed response is otherwise indistinguishable from a
+  // clean "found nothing" run, which would mask truncation, gateway splice,
+  // or prompt-injection-driven non-JSON output.
+  const parsed = parseAgentJsonArray({
+    resultText,
+    parseFailurePrefix: "Agent produced output that wasn't a parseable JSON findings array",
+    nonArrayMessage: (parsed) =>
+      `Agent produced JSON but not an array of file findings. Got: ${typeof parsed}`,
+  });
 
   const typedParsed = parsed as Array<{ filePath: string; findings: Finding[] }>;
   const results: InvestigateResult[] = [];
@@ -677,24 +733,14 @@ If severity should change, set \`adjustedSeverity\`. Omit if correct.
 }
 
 export function parseRevalidateVerdicts(resultText: string): RevalidateVerdict[] {
-  const jsonMatch = resultText.match(/```json\s*([\s\S]*?)```/);
-  const jsonStr = jsonMatch ? jsonMatch[1].trim() : resultText.trim();
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonStr);
-  } catch (err) {
-    // Same fail-loud rationale as parseInvestigateResults: silently
-    // returning [] for malformed output would mark a batch of findings
-    // as "no verdicts produced" instead of erroring, suppressing
-    // intended revalidation results.
-    const excerpt = resultText.slice(0, 400).replace(/\s+/g, " ");
-    throw new Error(
-      `Agent produced revalidation output that wasn't parseable JSON: ${err instanceof Error ? err.message : err}. ` +
-        `First 400 chars: ${excerpt}`,
-    );
-  }
-  if (!Array.isArray(parsed)) {
-    throw new Error(`Agent produced revalidation JSON but not an array. Got: ${typeof parsed}`);
-  }
+  // Same fail-loud rationale as parseInvestigateResults: only accept a
+  // strict or repaired JSON array. Anything else should mark the batch as
+  // errored instead of looking like "no verdicts produced".
+  const parsed = parseAgentJsonArray({
+    resultText,
+    parseFailurePrefix: "Agent produced revalidation output that wasn't parseable JSON",
+    nonArrayMessage: (parsed) =>
+      `Agent produced revalidation JSON but not an array. Got: ${typeof parsed}`,
+  });
   return parsed as RevalidateVerdict[];
 }

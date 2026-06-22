@@ -109,6 +109,9 @@ importers:
       '@openai/codex-sdk':
         specifier: ^0.125.0
         version: 0.125.0
+      jsonrepair:
+        specifier: ^3.14.0
+        version: 3.14.0
 
   packages/scanner:
     dependencies:
@@ -3190,6 +3193,11 @@ packages:
 
   /jsonlines@0.1.1:
     resolution: {integrity: sha512-ekDrAGso79Cvf+dtm+mL8OBI2bmAOt3gssYs833De/C9NmIpWDWyUO4zPgB5x2/OhY366dkhgfPMYfwZF7yOZA==}
+    dev: false
+
+  /jsonrepair@3.14.0:
+    resolution: {integrity: sha512-tWPGKMZf/8UPim+fcW2EfcQ/d/7aKUrP6IECz9G3Tu6Q5dX0orSleqJ9z6sSw7qrQkjF8/Edo4DvsWBZ8H+HNg==}
+    hasBin: true
     dev: false
 
   /jwa@2.0.1:
