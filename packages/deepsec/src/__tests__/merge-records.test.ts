@@ -196,11 +196,11 @@ describe("snapshotFileRecords + mergeAfterExtract", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("returns an empty snapshot when files/ doesn't exist", () => {
-    expect(snapshotFileRecords(dir).size).toBe(0);
+  it("returns an empty snapshot when the requested records don't exist", () => {
+    expect(snapshotFileRecords(dir, ["files/missing.ts.json"]).size).toBe(0);
   });
 
-  it("walks files/ recursively and indexes records by relative path", () => {
+  it("reads only the requested relative paths", () => {
     const inner = path.join(dir, "files", "src", "nested");
     fs.mkdirSync(inner, { recursive: true });
     fs.writeFileSync(
@@ -212,11 +212,17 @@ describe("snapshotFileRecords + mergeAfterExtract", () => {
       JSON.stringify(record({ filePath: "shallow.ts" })),
     );
 
-    const snap = snapshotFileRecords(dir);
+    const snap = snapshotFileRecords(dir, ["files/src/nested/deep.ts.json"]);
 
-    expect(snap.size).toBe(2);
-    expect(snap.has(path.join("files", "src", "nested", "deep.ts.json"))).toBe(true);
-    expect(snap.has(path.join("files", "shallow.ts.json"))).toBe(true);
+    expect(snap.size).toBe(1);
+    expect(snap.has("files/src/nested/deep.ts.json")).toBe(true);
+    expect(snap.has("files/shallow.ts.json")).toBe(false);
+  });
+
+  it("ignores requested paths outside files/", () => {
+    fs.mkdirSync(path.join(dir, "runs"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "runs", "r1.json"), JSON.stringify({ runId: "r1" }));
+    expect(snapshotFileRecords(dir, ["runs/r1.json"]).size).toBe(0);
   });
 
   it("rewrites only files that existed in both the host snapshot and the post-extract state", () => {
@@ -234,7 +240,8 @@ describe("snapshotFileRecords + mergeAfterExtract", () => {
         }),
       ),
     );
-    const snap = snapshotFileRecords(dir);
+    const tarballEntries = ["files/src/foo.ts.json", "files/src/bar.ts.json"];
+    const snap = snapshotFileRecords(dir, tarballEntries);
 
     // Simulate a tar extract overwriting that file with [codexB] only —
     // the pattern that drops history without merging.
@@ -261,7 +268,7 @@ describe("snapshotFileRecords + mergeAfterExtract", () => {
       ),
     );
 
-    const merged = mergeAfterExtract(dir, snap, "p");
+    const merged = mergeAfterExtract(dir, snap, "p", tarballEntries);
     expect(merged).toBe(1);
 
     const fooAfter = JSON.parse(fs.readFileSync(recPath, "utf-8"));
@@ -281,7 +288,7 @@ describe("snapshotFileRecords + mergeAfterExtract", () => {
     fs.writeFileSync(path.join(filesDir, "broken.ts.json"), "{not valid json");
     fs.writeFileSync(path.join(filesDir, "ok.ts.json"), JSON.stringify(record()));
 
-    const snap = snapshotFileRecords(dir);
+    const snap = snapshotFileRecords(dir, ["files/broken.ts.json", "files/ok.ts.json"]);
     expect(snap.size).toBe(1);
   });
 });

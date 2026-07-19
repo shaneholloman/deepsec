@@ -76,6 +76,41 @@ type LoggableCommand = {
   logs(opts?: { signal?: AbortSignal }): AsyncIterable<{ stream?: string; data: string }>;
 };
 
+// Memory-pressure backstop for the log streams. The SDK's internal pipe()
+// ignores write() backpressure, so a burst producer can buffer log data
+// inside the SDK faster than our consumed-byte caps drain it. That backlog
+// lives mostly in Buffers (external memory, NOT heapUsed), so the trigger
+// must sum heapUsed + external. On pressure, abort every live stream: the
+// abort propagates into the SDK and frees the backlog; cmd.wait() remains
+// the arbiter of command completion.
+const MEMORY_PRESSURE_ABORT_BYTES = 3 * 1024 * 1024 * 1024;
+const activeLogAborters = new Set<AbortController>();
+let memoryWatchdog: NodeJS.Timeout | undefined;
+
+function registerLogAborter(aborter: AbortController): void {
+  activeLogAborters.add(aborter);
+  if (!memoryWatchdog) {
+    memoryWatchdog = setInterval(() => {
+      const m = process.memoryUsage();
+      if (m.heapUsed + m.external > MEMORY_PRESSURE_ABORT_BYTES) {
+        for (const ctl of activeLogAborters) {
+          ctl.abort(new Error("memory pressure"));
+        }
+        activeLogAborters.clear();
+      }
+    }, 1000);
+    memoryWatchdog.unref();
+  }
+}
+
+function unregisterLogAborter(aborter: AbortController): void {
+  activeLogAborters.delete(aborter);
+  if (activeLogAborters.size === 0 && memoryWatchdog) {
+    clearInterval(memoryWatchdog);
+    memoryWatchdog = undefined;
+  }
+}
+
 async function streamLogsCapped(
   cmd: LoggableCommand,
   prefix: string,
@@ -83,6 +118,7 @@ async function streamLogsCapped(
   onRawLine?: (line: string) => void,
 ): Promise<void> {
   const aborter = new AbortController();
+  registerLogAborter(aborter);
   let remaining = MAX_LOG_BYTES_PER_SANDBOX;
   try {
     for await (const log of cmd.logs({ signal: aborter.signal })) {
@@ -108,6 +144,11 @@ async function streamLogsCapped(
     }
   } catch {
     // Stream errors (including our own abort) are non-fatal here.
+  } finally {
+    unregisterLogAborter(aborter);
+  }
+  if (aborter.signal.aborted && remaining > 0) {
+    onLog(`${prefix} [log stream aborted under memory pressure; further output suppressed]`);
   }
 }
 
@@ -118,6 +159,7 @@ async function streamLogsCapped(
  */
 async function readStderrCapped(cmd: LoggableCommand, maxChars: number): Promise<string> {
   const aborter = new AbortController();
+  registerLogAborter(aborter);
   let out = "";
   try {
     for await (const log of cmd.logs({ signal: aborter.signal })) {
@@ -130,6 +172,8 @@ async function readStderrCapped(cmd: LoggableCommand, maxChars: number): Promise
     }
   } catch {
     // Stream errors (including our own abort) are non-fatal here.
+  } finally {
+    unregisterLogAborter(aborter);
   }
   return out.slice(0, maxChars);
 }

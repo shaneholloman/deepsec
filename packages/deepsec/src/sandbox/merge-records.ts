@@ -10,42 +10,43 @@ import { type AnalysisEntry, type FileRecord, type Finding, fileRecordSchema } f
 const FILES_SUBDIR = "files";
 
 /**
- * Snapshot all existing file records under `<destDir>/files/` into a map
- * keyed by their path relative to `destDir` (e.g. `"files/src/foo.ts.json"`).
- *
- * Called BEFORE tar extraction so we have the host's pre-extraction state
- * to merge against once the tarball lands.
- *
- * Best-effort: malformed JSON is skipped silently rather than aborting the
- * download — a corrupt host record shouldn't block a sandbox upload, and
- * the incoming version will replace it via the normal extract path.
+ * Return true for tarball entry paths the merge machinery cares about:
+ * file records under `files/**.json`. Run metadata (`runs/*.json`) is
+ * unique per runId, so the tar overwrite is safe there and needs no merge.
  */
-export function snapshotFileRecords(destDir: string): Map<string, FileRecord> {
-  const out = new Map<string, FileRecord>();
-  const filesRoot = path.join(destDir, FILES_SUBDIR);
-  if (!fs.existsSync(filesRoot)) return out;
+export function isFileRecordPath(rel: string): boolean {
+  const norm = rel.replaceAll("\\", "/");
+  return norm.startsWith(`${FILES_SUBDIR}/`) && norm.endsWith(".json");
+}
 
-  const stack: string[] = [filesRoot];
-  while (stack.length > 0) {
-    const dir = stack.pop()!;
-    let entries: fs.Dirent[];
+/**
+ * Snapshot the existing file records at the given `destDir`-relative paths
+ * (e.g. `"files/src/foo.ts.json"`) into a map keyed by that path.
+ *
+ * Called BEFORE tar extraction, with the tarball's own entry list, so we
+ * have the host's pre-extraction state to merge against once the tarball
+ * lands. Deliberately NOT a full walk of `files/**`: projects can hold
+ * tens of thousands of records (~150MB heap per full snapshot), and the
+ * streaming download loop runs this per sandbox — full snapshots stacked
+ * across 30 concurrent loops are what OOM'd the orchestrator.
+ *
+ * Best-effort: missing files and malformed JSON are skipped silently
+ * rather than aborting the download — a corrupt or absent host record
+ * shouldn't block a sandbox upload, and the incoming version will replace
+ * it via the normal extract path.
+ */
+export function snapshotFileRecords(
+  destDir: string,
+  relPaths: Iterable<string>,
+): Map<string, FileRecord> {
+  const out = new Map<string, FileRecord>();
+  for (const rel of relPaths) {
+    if (!isFileRecordPath(rel)) continue;
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
+      const raw = JSON.parse(fs.readFileSync(path.join(destDir, rel), "utf-8"));
+      out.set(rel, raw as FileRecord);
     } catch {
-      continue;
-    }
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        stack.push(full);
-      } else if (e.isFile() && e.name.endsWith(".json")) {
-        try {
-          const raw = JSON.parse(fs.readFileSync(full, "utf-8"));
-          out.set(path.relative(destDir, full), raw as FileRecord);
-        } catch {
-          // skip malformed
-        }
-      }
+      // missing or malformed — nothing to merge against
     }
   }
   return out;
@@ -131,8 +132,12 @@ function mergeFinding(host: Finding, incoming: Finding): Finding {
 }
 
 /**
- * After tar extraction, walk `<destDir>/files/**.json` and re-write any
- * record that also existed in `hostSnapshot` with a merged version.
+ * After tar extraction, validate every file record the tarball wrote
+ * (`relPaths` — the same entry list the pre-extract validation pass
+ * produced) and re-write any that also existed in `hostSnapshot` with a
+ * merged version. Records not in the tarball were not touched by the
+ * extract and are left alone — walking the whole tree here would re-parse
+ * and re-validate the entire project dataset on every streaming poll.
  *
  * Sandbox output is the trust boundary, so every incoming record must:
  *   - parse as JSON
@@ -157,64 +162,55 @@ function mergeFinding(host: Finding, incoming: Finding): Finding {
 export function mergeAfterExtract(
   destDir: string,
   hostSnapshot: Map<string, FileRecord>,
-  expectedProjectId?: string,
+  expectedProjectId: string | undefined,
+  relPaths: Iterable<string>,
 ): number {
-  const filesRoot = path.join(destDir, FILES_SUBDIR);
-  if (!fs.existsSync(filesRoot)) return 0;
   const requireProjectId = expectedProjectId ?? path.basename(destDir);
 
   let merged = 0;
-  const stack: string[] = [filesRoot];
-  while (stack.length > 0) {
-    const dir = stack.pop()!;
-    let entries: fs.Dirent[];
+  for (const relRaw of relPaths) {
+    if (!isFileRecordPath(relRaw)) continue;
+    const rel = relRaw.replaceAll("\\", "/");
+    const full = path.join(destDir, rel);
+    const host = hostSnapshot.get(relRaw) ?? hostSnapshot.get(rel);
+
+    let raw: string;
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
+      raw = fs.readFileSync(full, "utf-8");
     } catch {
+      // The tarball listed it but nothing landed on disk — nothing to do.
       continue;
     }
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        stack.push(full);
-        continue;
-      }
-      if (!(e.isFile() && e.name.endsWith(".json"))) continue;
-      const rel = path.relative(destDir, full);
-      const host = hostSnapshot.get(rel);
 
-      let raw: unknown;
-      try {
-        raw = JSON.parse(fs.readFileSync(full, "utf-8"));
-      } catch {
-        // Malformed JSON — restore host snapshot if we have one, else drop.
-        restoreOrDrop(full, host);
-        continue;
-      }
-
-      const parsed = fileRecordSchema.safeParse(raw);
-      if (!parsed.success) {
-        restoreOrDrop(full, host);
-        continue;
-      }
-      const incoming = parsed.data;
-
-      // Sandbox tarball came from `data/<projectId>/`, so every record in
-      // it must claim that same projectId, and the on-disk path must match
-      // its declared filePath.
-      const expectedRel = path
-        .join(FILES_SUBDIR, `${incoming.filePath}.json`)
-        .replaceAll("\\", "/");
-      if (incoming.projectId !== requireProjectId || rel.replaceAll("\\", "/") !== expectedRel) {
-        restoreOrDrop(full, host);
-        continue;
-      }
-
-      if (!host) continue;
-      const out = mergeFileRecord(host, incoming);
-      fs.writeFileSync(full, JSON.stringify(out, null, 2) + "\n");
-      merged++;
+    let parsedRaw: unknown;
+    try {
+      parsedRaw = JSON.parse(raw);
+    } catch {
+      // Malformed JSON — restore host snapshot if we have one, else drop.
+      restoreOrDrop(full, host);
+      continue;
     }
+
+    const parsed = fileRecordSchema.safeParse(parsedRaw);
+    if (!parsed.success) {
+      restoreOrDrop(full, host);
+      continue;
+    }
+    const incoming = parsed.data;
+
+    // Sandbox tarball came from `data/<projectId>/`, so every record in
+    // it must claim that same projectId, and the on-disk path must match
+    // its declared filePath.
+    const expectedRel = path.join(FILES_SUBDIR, `${incoming.filePath}.json`).replaceAll("\\", "/");
+    if (incoming.projectId !== requireProjectId || rel !== expectedRel) {
+      restoreOrDrop(full, host);
+      continue;
+    }
+
+    if (!host) continue;
+    const out = mergeFileRecord(host, incoming);
+    fs.writeFileSync(full, JSON.stringify(out, null, 2) + "\n");
+    merged++;
   }
   return merged;
 }
